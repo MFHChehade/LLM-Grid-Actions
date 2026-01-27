@@ -1,32 +1,11 @@
-# python/analyze_eval_vselect.py
+# python/analyze_eval_vselect_with_nn.py
 #
-# OPTION A (publishable):
-#   - Keep AC failures as sentinel (raw 1e6), DO NOT filter them out
-#   - For J_ac distribution plots: SUCCESS-ONLY values (J_ac < sentinel)
-#   - Add reliability figures (AC fail rate)
-#   - Add pairwise success-overlap delta plots (avoid survivorship bias)
-#
-# UPDATED (match MATLAB default scaling):
-#   - Divide ALL J_ac_* values by JAC_SCALE = 30,000 (including sentinel after fill)
-#     => raw sentinel 1e6 becomes (1e6 / 30000) = 33.33 in scaled units
-#
-# UPDATED (per request):
-#   - For J_ac-related plots (boxplots, pairwise deltas, tradeoff scatter),
-#     EXCLUDE zero_shot and only show SFT and DPO (if present).
-#   - Keep success-rate plots (reliability) including zero_shot.
-#
-# UPDATED (per request):
-#   - Y-axis labels should NOT mention any scaling (no "/ 3*1e4", no "/ 1e5").
-#     Just label as V_pen or J_ac (values are scaled internally).
-#
-# UPDATED (publishable plots, your latest request):
-#   - EVEN larger fonts (labels + tick numbers) to be safe
-#   - Thinner boxplot lines (boxes/whiskers/caps/median)
-#   - Narrower box widths
-#   - Consistent serif font + embedded PDF fonts
-#   - FAIR J_ac boxplots using SUCCESS-OVERLAP across shown models
-#   - Remove per-model success counts from x-labels
+# Combine LLM v-select evaluation with NN v-select evaluation, then produce
+# publishable stats + figures comparing models on J_dc, V_pen (J_ac), and reliability.
 
+from __future__ import annotations
+
+import argparse
 import re
 from pathlib import Path
 from typing import List, Dict, Tuple
@@ -38,68 +17,83 @@ from matplotlib.ticker import ScalarFormatter
 
 ROOT    = Path(__file__).resolve().parents[1]
 IO_DIR  = ROOT / "io"
-CSV_IN  = IO_DIR / "eval_vselect_jdc_jac_per_xi.csv"
-FIG_DIR = IO_DIR / "figs_eval"
-FIG_DIR.mkdir(exist_ok=True)
-
-CONFIG     = ROOT / "config"
+CONFIG  = ROOT / "config"
 LIMITS_YML = CONFIG / "limits.yml"
 
-SUMMARY_CSV        = IO_DIR / "eval_stats_per_model.csv"
-PAIRWISE_CSV       = IO_DIR / "eval_stats_pairwise.csv"
-GLOBAL_SUMMARY_CSV = IO_DIR / "eval_stats_global.csv"
+CSV_LLM_DEFAULT = IO_DIR / "eval_vselect_jdc_jac_per_xi.csv"
 
-# ---- Scaling for J_ac (match MATLAB default voltage_scale=30000) ----
+CSV_MERGED_DEFAULT   = IO_DIR / "eval_vselect_jdc_jac_per_xi_with_nn.csv"
+FIG_DIR_DEFAULT      = IO_DIR / "figs_eval_with_nn"
+GLOBAL_SUMMARY_CSV   = IO_DIR / "eval_stats_global_with_nn.csv"
+SUMMARY_CSV          = IO_DIR / "eval_stats_per_model_with_nn.csv"
+PAIRWISE_CSV         = IO_DIR / "eval_stats_pairwise_with_nn.csv"
+
 JAC_SCALE = 30000.0
 AC_FAIL_SENTINEL_RAW = 1e6
-AC_FAIL_SENTINEL     = AC_FAIL_SENTINEL_RAW / JAC_SCALE  # = 33.33...
+AC_FAIL_SENTINEL     = AC_FAIL_SENTINEL_RAW / JAC_SCALE
 
-# ---- Plot styling ----
-FIG_DPI = 600
-BOX_WIDTH = 0.30  # narrower boxes
-
-plt.rcParams.update({
-    # Fonts (paper-friendly serif + STIX math)
-    "font.family": "serif",
-    "font.serif": ["Times New Roman", "Times", "DejaVu Serif"],
-    "mathtext.fontset": "stix",
-
-    # EVEN larger fonts (safe for slides + papers)
-    "font.size": 16,
-    "axes.labelsize": 18,
-    "xtick.labelsize": 15,
-    "ytick.labelsize": 15,
-    "legend.fontsize": 15,
-
-    # Keep lines/ticks thin so big fonts don't feel heavy
-    "axes.linewidth": 0.75,
-    "lines.linewidth": 0.95,
-    "xtick.direction": "out",
-    "ytick.direction": "out",
-    "xtick.major.size": 4.2,
-    "ytick.major.size": 4.2,
-    "xtick.major.width": 0.75,
-    "ytick.major.width": 0.75,
-
-    # Grids
-    "axes.axisbelow": True,
-
-    # Save
-    "savefig.bbox": "tight",
-    "savefig.pad_inches": 0.02,
-
-    # Embed fonts in PDF/PS (avoid Type-3 fonts)
-    "pdf.fonttype": 42,
-    "ps.fonttype": 42,
-
-    "axes.unicode_minus": False,
-})
+FIG_DPI = 700
 
 
-# ----------------- helpers ----------------- #
+def set_pub_rcparams() -> None:
+    plt.rcParams.update({
+        "pdf.fonttype": 42,
+        "ps.fonttype": 42,
+        "font.family": "serif",
+        "font.serif": ["Times New Roman", "Times", "DejaVu Serif"],
+        "mathtext.fontset": "stix",
+
+        "font.size": 22,
+        "axes.labelsize": 28,
+        "xtick.labelsize": 22,
+        "ytick.labelsize": 22,
+
+        "axes.linewidth": 0.95,
+        "lines.linewidth": 1.0,
+
+        "savefig.bbox": "tight",
+        "savefig.pad_inches": 0.02,
+        "axes.unicode_minus": False,
+    })
+
+
+def _format_pub_ax(ax: plt.Axes) -> None:
+    ax.set_axisbelow(True)
+    ax.grid(True, axis="y", linestyle="--", linewidth=0.8, alpha=0.18)
+
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    for side in ["left", "bottom"]:
+        ax.spines[side].set_linewidth(0.95)
+        ax.spines[side].set_color("black")
+
+    ax.tick_params(direction="out", length=6.0, width=0.95, colors="black")
+    ax.minorticks_on()
+    ax.tick_params(which="minor", direction="out", length=3.0, width=0.7, colors="black")
+
+    fmt = ScalarFormatter(useMathText=True)
+    fmt.set_powerlimits((-3, 4))
+    ax.yaxis.set_major_formatter(fmt)
+
+
+def disp_name(m: str) -> str:
+    """Pretty display name for plots."""
+    return "zero shot" if m == "zero_shot" else m
+
+
+def _coerce_numeric(s: pd.Series) -> pd.Series:
+    s = pd.to_numeric(s, errors="coerce")
+    s = s.replace([np.inf, -np.inf], np.nan)
+    return s
+
+
+def _savefig(fig_dir: Path, base_name: str, dpi: int = FIG_DPI) -> None:
+    fig_dir.mkdir(parents=True, exist_ok=True)
+    plt.savefig(fig_dir / f"{base_name}.png", dpi=dpi)
+    plt.savefig(fig_dir / f"{base_name}.pdf")
+
 
 def read_gamma_from_limits() -> float:
-    """Parse gamma from limits.yml (same as MATLAB), default 100 if missing."""
     try:
         txt = LIMITS_YML.read_text(encoding="utf-8")
     except Exception:
@@ -114,7 +108,6 @@ def read_gamma_from_limits() -> float:
 
 
 def detect_models(df: pd.DataFrame) -> List[str]:
-    """Infer model names from J_dc_* columns, excluding gt/base."""
     models = []
     for col in df.columns:
         if col.startswith("J_dc_") and col not in ("J_dc_gt", "J_dc_base"):
@@ -123,70 +116,15 @@ def detect_models(df: pd.DataFrame) -> List[str]:
 
 
 def order_models(models: List[str]) -> List[str]:
-    """Prefer a conventional order if present."""
-    preferred = ["zero_shot", "sft", "dpo"]
+    preferred = ["zero_shot", "sft", "dpo", "nn"]
     out = [m for m in preferred if m in models]
     out += [m for m in models if m not in out]
     return out
 
 
 def select_jac_models(models_all: List[str]) -> List[str]:
-    """
-    For J_ac plots: show only SFT and DPO (no zero_shot), per request.
-    If one is missing, use what exists. If both missing, fall back to any non-zero_shot models.
-    """
-    wanted = [m for m in ["sft", "dpo"] if m in models_all]
-    if wanted:
-        return wanted
-    fallback = [m for m in models_all if m != "zero_shot"]
-    return fallback
-
-
-def _coerce_numeric(s: pd.Series) -> pd.Series:
-    s = pd.to_numeric(s, errors="coerce")
-    s = s.replace([np.inf, -np.inf], np.nan)
-    return s
-
-
-def _savefig(base_name: str, dpi: int = FIG_DPI) -> None:
-    """Save current figure as both PNG and PDF."""
-    png = FIG_DIR / f"{base_name}.png"
-    pdf = FIG_DIR / f"{base_name}.pdf"
-    plt.savefig(png, dpi=dpi)
-    plt.savefig(pdf)  # vector
-
-
-def _format_pub_ax(ax):
-    """Consistent formatting (big fonts, subtle grid)."""
-    ax.grid(axis="y", linestyle="--", alpha=0.16, linewidth=0.65)
-    ax.tick_params(which="both", top=False, right=False)
-
-    ax.minorticks_on()
-    ax.tick_params(which="minor", length=2.6, width=0.55)
-
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
-
-    fmt = ScalarFormatter(useMathText=True)
-    fmt.set_powerlimits((-3, 4))
-    ax.yaxis.set_major_formatter(fmt)
-
-
-def _boxplot_bw(ax, data, labels, ylabel: str):
-    """B/W boxplot: thin lines + narrow boxes + big fonts."""
-    ax.boxplot(
-        data,
-        labels=labels,
-        showfliers=False,
-        patch_artist=False,
-        widths=BOX_WIDTH,
-        medianprops=dict(color="black", linewidth=0.95),
-        boxprops=dict(color="black", linewidth=0.65),
-        whiskerprops=dict(color="black", linewidth=0.60),
-        capprops=dict(color="black", linewidth=0.60),
-    )
-    ax.set_ylabel(ylabel)
-    _format_pub_ax(ax)
+    wanted = [m for m in ["sft", "dpo", "nn"] if m in models_all]
+    return wanted if wanted else [m for m in models_all if m != "zero_shot"]
 
 
 def _ac_fail_rate(df: pd.DataFrame, col: str) -> float:
@@ -197,33 +135,72 @@ def _ac_fail_rate(df: pd.DataFrame, col: str) -> float:
     return float(((v >= AC_FAIL_SENTINEL) & mask).mean())
 
 
-def _success_overlap_mask(df: pd.DataFrame, jac_models: List[str]) -> pd.Series:
-    """
-    Mask of scenarios where ALL jac_models succeed (J_ac < sentinel).
-    Since we fill missing with sentinel, this is the "common valid success set".
-    """
-    if not jac_models:
-        return pd.Series(False, index=df.index)
+def _boxplot_bw(ax, data, labels, ylabel: str, widths: float = 0.42):
+    ax.boxplot(
+        data,
+        labels=labels,
+        widths=widths,
+        showfliers=False,
+        patch_artist=False,
+        medianprops=dict(color="black", linewidth=1.2),
+        boxprops=dict(color="black", linewidth=0.9),
+        whiskerprops=dict(color="black", linewidth=0.9),
+        capprops=dict(color="black", linewidth=0.9),
+    )
+    ax.set_ylabel(ylabel)
+    _format_pub_ax(ax)
 
-    masks = []
-    for m in jac_models:
-        col = f"J_ac_{m}"
-        if col not in df.columns:
-            continue
-        v = _coerce_numeric(df[col])
-        masks.append(v.notna() & (v < AC_FAIL_SENTINEL))
 
-    if not masks:
-        return pd.Series(False, index=df.index)
+def find_latest_nn_csv(io_dir: Path) -> Path | None:
+    p0 = io_dir / "eval_nn_vselect_per_xi.csv"
+    if p0.exists():
+        return p0
+    cands = sorted(io_dir.glob("eval_nn_vselect_per_xi_run*.csv"), key=lambda p: p.stat().st_mtime)
+    return cands[-1] if cands else None
 
-    out = masks[0].copy()
-    for mm in masks[1:]:
-        out &= mm
-    return out
+
+def merge_llm_and_nn(llm_csv: Path, nn_csv: Path, out_csv: Path, how: str = "inner") -> pd.DataFrame:
+    df_llm = pd.read_csv(llm_csv)
+    df_nn  = pd.read_csv(nn_csv)
+
+    rename = {}
+    if "J_dc" in df_nn.columns: rename["J_dc"] = "J_dc_nn"
+    if "J_ac" in df_nn.columns: rename["J_ac"] = "J_ac_nn"
+    if "shed_MW" in df_nn.columns: rename["shed_MW"] = "shed_MW_nn"
+    if "best_plan_text" in df_nn.columns: rename["best_plan_text"] = "best_plan_text_nn"
+    if "V_pen_effective" in df_nn.columns and "J_ac" not in df_nn.columns:
+        rename["V_pen_effective"] = "J_ac_nn"
+
+    df_nn = df_nn.rename(columns=rename)
+
+    drop_cols = [c for c in ["J_dc_gt","J_dc_base","shed_MW_gt","shed_MW_base"] if c in df_nn.columns]
+    if drop_cols:
+        df_nn = df_nn.drop(columns=drop_cols)
+
+    if "xi" not in df_llm.columns or "xi" not in df_nn.columns:
+        raise RuntimeError("Both CSVs must contain an 'xi' column for merging.")
+
+    df = df_llm.merge(df_nn, on="xi", how=how, suffixes=("", "_dup"))
+    dup_cols = [c for c in df.columns if c.endswith("_dup")]
+    if dup_cols:
+        df = df.drop(columns=dup_cols)
+
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(out_csv, index=False)
+    return df
+
+
+def filter_complete_cases_for_models(df: pd.DataFrame, jac_models: List[str]) -> pd.DataFrame:
+    cols = [f"J_ac_{m}" for m in jac_models if f"J_ac_{m}" in df.columns]
+    if not cols:
+        return df
+    mask = pd.Series(True, index=df.index)
+    for c in cols:
+        mask &= _coerce_numeric(df[c]).notna()
+    return df.loc[mask].copy()
 
 
 # ----------------- stats ----------------- #
-
 def basic_global_stats(df: pd.DataFrame) -> pd.DataFrame:
     out: Dict[str, float] = {}
     out["n_scenarios"] = int(df["xi"].nunique())
@@ -272,7 +249,7 @@ def per_model_stats(df: pd.DataFrame, models: List[str]) -> pd.DataFrame:
             continue
 
         jdc = _coerce_numeric(df[col_jdc])
-        jac = _coerce_numeric(df[col_jac])  # already scaled in main()
+        jac = _coerce_numeric(df[col_jac])
 
         mask_jac = jac.notna()
         mask_success = mask_jac & (jac < AC_FAIL_SENTINEL)
@@ -430,8 +407,7 @@ def pairwise_stats(df: pd.DataFrame, models: List[str]) -> pd.DataFrame:
 
 
 # ----------------- FIGURES ----------------- #
-
-def plot_Jdc_boxplot_5(df: pd.DataFrame, models: List[str]) -> None:
+def plot_Jdc_boxplot_5(fig_dir: Path, df: pd.DataFrame, models: List[str]) -> None:
     names = ["baseline", "opt"] + models
     data, labels = [], []
 
@@ -446,72 +422,79 @@ def plot_Jdc_boxplot_5(df: pd.DataFrame, models: List[str]) -> None:
                 continue
             arr = _coerce_numeric(df[col]).dropna()
 
-        if arr.empty:
-            continue
-        data.append(arr.values)
-        labels.append(name)
+        if not arr.empty:
+            data.append(arr.values)
+            labels.append(disp_name(name) if name not in ("baseline","opt") else name)
 
     if not data:
         return
 
-    fig, ax = plt.subplots(figsize=(8.8, 4.2))
-    _boxplot_bw(ax, data, labels, ylabel=r"$J_{dc}$")
+    set_pub_rcparams()
+    fig, ax = plt.subplots(figsize=(7.6, 3.6), dpi=170)
+    _boxplot_bw(ax, data, labels, ylabel=r"$J_{dc}$", widths=0.40)
     fig.tight_layout(pad=0.25)
-    _savefig("box_Jdc_5methods")
+    _savefig(fig_dir, "box_Jdc_5methods")
     plt.close(fig)
 
 
-def plot_Jdc_boxplot_models_only(df: pd.DataFrame, models: List[str]) -> None:
+def plot_Jdc_boxplot_models_only(fig_dir: Path, df: pd.DataFrame, models: List[str]) -> None:
     data, labels = [], []
     for m in models:
         col = f"J_dc_{m}"
         if col not in df.columns:
             continue
         arr = _coerce_numeric(df[col]).dropna()
-        if arr.empty:
-            continue
-        data.append(arr.values)
-        labels.append(m)
+        if not arr.empty:
+            data.append(arr.values)
+            labels.append(disp_name(m))
 
     if not data:
         return
 
-    fig, ax = plt.subplots(figsize=(8.2, 4.2))
-    _boxplot_bw(ax, data, labels, ylabel=r"$J_{dc}$")
+    set_pub_rcparams()
+    fig, ax = plt.subplots(figsize=(7.0, 3.6), dpi=170)
+    _boxplot_bw(ax, data, labels, ylabel=r"$J_{dc}$", widths=0.40)
     fig.tight_layout(pad=0.25)
-    _savefig("box_Jdc_models_only")
+    _savefig(fig_dir, "box_Jdc_models_only")
     plt.close(fig)
 
 
-def plot_ac_fail_rate_bar(df: pd.DataFrame, models: List[str]) -> None:
+def plot_ac_fail_rate_bar(fig_dir: Path, df: pd.DataFrame, models: List[str]) -> None:
     rates = []
     for m in models:
         col = f"J_ac_{m}"
         rates.append(_ac_fail_rate(df, col) if col in df.columns else np.nan)
 
-    fig, ax = plt.subplots(figsize=(8.0, 4.0))
+    set_pub_rcparams()
+    fig, ax = plt.subplots(figsize=(7.4, 3.4), dpi=170)
     x = np.arange(len(models))
-    ax.bar(x, rates, color="0.75", edgecolor="black", linewidth=0.7)
+    ax.bar(x, rates, color="0.78", edgecolor="black", linewidth=0.95)
     ax.set_xticks(x)
-    ax.set_xticklabels(models)
+    ax.set_xticklabels([disp_name(m) for m in models])
     ax.set_ylim(0.0, 1.0)
     ax.set_ylabel("AC failure rate")
     _format_pub_ax(ax)
 
     for xi, r in zip(x, rates):
         if np.isfinite(r):
-            ax.text(xi, min(1.0, r + 0.04), f"{100*r:.1f}%", ha="center", va="bottom", fontsize=14)
+            ax.text(xi, min(1.0, r + 0.025), f"{100*r:.1f}%", ha="center", va="bottom", fontsize=20)
 
     fig.tight_layout(pad=0.25)
-    _savefig("bar_ac_fail_rate_models")
+    _savefig(fig_dir, "bar_ac_fail_rate_models")
     plt.close(fig)
 
 
-def plot_Jac_boxplot_models_success_overlap(df: pd.DataFrame, jac_models: List[str]) -> None:
-    if not jac_models:
+def plot_Jac_boxplot_models_success_only_common_success(fig_dir: Path, df: pd.DataFrame, jac_models: List[str]) -> None:
+    cols = [f"J_ac_{m}" for m in jac_models if f"J_ac_{m}" in df.columns]
+    if not cols:
         return
-    mask_overlap = _success_overlap_mask(df, jac_models)
-    if not mask_overlap.any():
+
+    mask = pd.Series(True, index=df.index)
+    for c in cols:
+        v = _coerce_numeric(df[c])
+        mask &= v.notna() & (v < AC_FAIL_SENTINEL)
+
+    if not mask.any():
         return
 
     data, labels = [], []
@@ -519,73 +502,25 @@ def plot_Jac_boxplot_models_success_overlap(df: pd.DataFrame, jac_models: List[s
         col = f"J_ac_{m}"
         if col not in df.columns:
             continue
-        v = _coerce_numeric(df[col])
-        arr = v[mask_overlap].dropna()
-        if arr.empty:
-            continue
-        data.append(arr.values)
-        labels.append(m)
+        v = _coerce_numeric(df[col])[mask]
+        if v.empty:
+            return
+        data.append(v.values)
+        labels.append(disp_name(m))
 
     if not data:
         return
 
-    fig, ax = plt.subplots(figsize=(7.8, 4.2))
-    _boxplot_bw(ax, data, labels, ylabel=r"$V_{\mathrm{pen}}$")
+    set_pub_rcparams()
+    fig, ax = plt.subplots(figsize=(7.0, 3.6), dpi=170)
+    # (2) y-axis: DO NOT mention success-only
+    _boxplot_bw(ax, data, labels, ylabel=r"$V_{\mathrm{pen}}$", widths=0.38)
     fig.tight_layout(pad=0.25)
-    _savefig("box_Jac_models_success_overlap")
+    _savefig(fig_dir, "box_Jac_models_common_success")
     plt.close(fig)
 
 
-def plot_ac_reliability_plus_quality_panel(df: pd.DataFrame, models_success: List[str], jac_models: List[str]) -> None:
-    rates = []
-    for m in models_success:
-        col = f"J_ac_{m}"
-        rates.append(_ac_fail_rate(df, col) if col in df.columns else np.nan)
-
-    fig, (ax1, ax2) = plt.subplots(
-        1, 2, figsize=(13.6, 4.2),
-        gridspec_kw={"width_ratios": [1.05, 1.0]}
-    )
-
-    x = np.arange(len(models_success))
-    ax1.bar(x, rates, color="0.75", edgecolor="black", linewidth=0.7)
-    ax1.set_xticks(x)
-    ax1.set_xticklabels(models_success)
-    ax1.set_ylim(0.0, 1.0)
-    ax1.set_ylabel("AC failure rate")
-    _format_pub_ax(ax1)
-
-    for xi, r in zip(x, rates):
-        if np.isfinite(r):
-            ax1.text(xi, min(1.0, r + 0.04), f"{100*r:.1f}%", ha="center", va="bottom", fontsize=14)
-
-    if jac_models:
-        mask_overlap = _success_overlap_mask(df, jac_models)
-        data, labels = [], []
-        for m in jac_models:
-            col = f"J_ac_{m}"
-            if col not in df.columns:
-                continue
-            v = _coerce_numeric(df[col])
-            arr = v[mask_overlap].dropna()
-            if arr.empty:
-                continue
-            data.append(arr.values)
-            labels.append(m)
-
-        if data:
-            _boxplot_bw(ax2, data, labels, ylabel=r"$V_{\mathrm{pen}}$")
-        else:
-            ax2.axis("off")
-    else:
-        ax2.axis("off")
-
-    fig.tight_layout(pad=0.25)
-    _savefig("panel_ac_reliability_and_quality")
-    plt.close(fig)
-
-
-def plot_pairwise_delta_Jac_success_only(df: pd.DataFrame, jac_models: List[str]) -> None:
+def plot_pairwise_delta_Jac_success_only(fig_dir: Path, df: pd.DataFrame, jac_models: List[str]) -> None:
     if len(jac_models) < 2:
         return
 
@@ -609,20 +544,21 @@ def plot_pairwise_delta_Jac_success_only(df: pd.DataFrame, jac_models: List[str]
 
         delta = (vb - va)[mask].values
         data.append(delta)
-        labels.append(f"{b} - {a}")
+        labels.append(f"{disp_name(b)} - {disp_name(a)}\n(n={int(mask.sum())})")
 
     if not data:
         return
 
-    fig, ax = plt.subplots(figsize=(9.4, 4.2))
-    _boxplot_bw(ax, data, labels, ylabel=r"$\Delta V_{\mathrm{pen}}$")
-    ax.axhline(0.0, color="black", linewidth=0.9, linestyle="--", alpha=0.8)
+    set_pub_rcparams()
+    fig, ax = plt.subplots(figsize=(8.6, 3.6), dpi=170)
+    _boxplot_bw(ax, data, labels, ylabel=r"$\Delta V_{\mathrm{pen}}$ (success overlap)", widths=0.36)
+    ax.axhline(0.0, color="black", linewidth=0.95, linestyle="--", alpha=0.7)
     fig.tight_layout(pad=0.25)
-    _savefig("box_pairwise_delta_Jac_success_overlap")
+    _savefig(fig_dir, "box_pairwise_delta_Jac_success_overlap")
     plt.close(fig)
 
 
-def plot_tradeoff_successrate_vs_Jac(df: pd.DataFrame, jac_models: List[str]) -> None:
+def plot_tradeoff_successrate_vs_Jac(fig_dir: Path, df: pd.DataFrame, jac_models: List[str]) -> None:
     xs, ys, labs = [], [], []
     for m in jac_models:
         col = f"J_ac_{m}"
@@ -643,12 +579,13 @@ def plot_tradeoff_successrate_vs_Jac(df: pd.DataFrame, jac_models: List[str]) ->
     if not xs:
         return
 
-    fig, ax = plt.subplots(figsize=(8.6, 4.2))
-    ax.scatter(xs, ys, s=80, marker="o", edgecolor="black", facecolor="0.75", linewidth=0.8)
+    set_pub_rcparams()
+    fig, ax = plt.subplots(figsize=(7.0, 3.6), dpi=170)
+    ax.scatter(xs, ys, marker="o", edgecolor="black", facecolor="0.78", linewidth=0.95, s=70)
 
     for x, y, lab in zip(xs, ys, labs):
         if np.isfinite(x) and np.isfinite(y):
-            ax.text(x + 0.016, y, lab, fontsize=16, va="center")
+            ax.text(x + 0.012, y, disp_name(lab), fontsize=22, va="center")
 
     ax.set_xlim(-0.02, 1.02)
     ax.set_xlabel("AC success rate")
@@ -656,31 +593,43 @@ def plot_tradeoff_successrate_vs_Jac(df: pd.DataFrame, jac_models: List[str]) ->
     _format_pub_ax(ax)
 
     fig.tight_layout(pad=0.25)
-    _savefig("scatter_tradeoff_successrate_vs_median_Jac")
+    _savefig(fig_dir, "scatter_tradeoff_successrate_vs_median_Jac")
     plt.close(fig)
 
 
-# ----------------- main ----------------- #
-
 def main():
-    if not CSV_IN.exists():
-        raise FileNotFoundError(f"Missing input CSV: {CSV_IN}")
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--llm_csv", type=str, default=str(CSV_LLM_DEFAULT))
+    ap.add_argument("--nn_csv", type=str, default="")
+    ap.add_argument("--out_csv", type=str, default=str(CSV_MERGED_DEFAULT))
+    ap.add_argument("--fig_dir", type=str, default=str(FIG_DIR_DEFAULT))
+    ap.add_argument("--join", type=str, default="inner", choices=["inner","outer"])
+    ap.add_argument("--jac_complete_cases", action="store_true", default=True)
+    args = ap.parse_args()
 
-    df = pd.read_csv(CSV_IN)
+    llm_csv = Path(args.llm_csv)
+    if not llm_csv.exists():
+        raise FileNotFoundError(f"Missing LLM input CSV: {llm_csv}")
 
-    models_all = order_models(detect_models(df))
-    jac_models = select_jac_models(models_all)
+    nn_csv = Path(args.nn_csv) if args.nn_csv else (find_latest_nn_csv(IO_DIR) or Path(""))
+    if not nn_csv or not nn_csv.exists():
+        raise FileNotFoundError(
+            "Could not find NN per-xi CSV. Expected io/eval_nn_vselect_per_xi.csv or io/eval_nn_vselect_per_xi_run*.csv.\n"
+            "Pass --nn_csv path/to/file.csv if it lives elsewhere."
+        )
 
-    print("Detected models (all):", models_all)
-    print("Models used for J_ac plots:", jac_models)
+    out_csv = Path(args.out_csv)
+    fig_dir = Path(args.fig_dir)
 
-    # ---- Fill missing/invalid J_ac_* with RAW sentinel, then SCALE by JAC_SCALE ----
+    df = merge_llm_and_nn(llm_csv, nn_csv, out_csv, how=args.join)
+    print(f"Merge join='{args.join}': n_merged={df.shape[0]}")
+    print(f"Merged per-xi table -> {out_csv}")
+
     jac_cols = [c for c in df.columns if c.startswith("J_ac_")]
     if jac_cols:
         df[jac_cols] = df[jac_cols].apply(pd.to_numeric, errors="coerce")
         df[jac_cols] = df[jac_cols].replace([np.inf, -np.inf], np.nan).fillna(AC_FAIL_SENTINEL_RAW)
         df[jac_cols] = df[jac_cols] / JAC_SCALE
-
         total_fail_entries = int((df[jac_cols] >= AC_FAIL_SENTINEL).sum().sum())
         print(
             f"J_ac fill+scale done: divide by {JAC_SCALE:.0f}. "
@@ -688,27 +637,23 @@ def main():
             f"Total entries >= sentinel: {total_fail_entries}"
         )
 
-    # ---- Stats ----
-    global_stats_df = basic_global_stats(df)
-    per_model_df    = per_model_stats(df, models_all)
-    pairwise_df     = pairwise_stats(df, models_all)
+    models_all = order_models(detect_models(df))
+    jac_models = select_jac_models(models_all)
 
-    global_stats_df.to_csv(GLOBAL_SUMMARY_CSV, index=False)
-    per_model_df.to_csv(SUMMARY_CSV, index=False)
-    pairwise_df.to_csv(PAIRWISE_CSV, index=False)
+    df_jac = filter_complete_cases_for_models(df, jac_models) if args.jac_complete_cases else df
 
-    # ---- Figures ----
-    plot_Jdc_boxplot_5(df, models_all)
-    plot_Jdc_boxplot_models_only(df, models_all)
-    plot_ac_fail_rate_bar(df, models_all)
+    basic_global_stats(df).to_csv(GLOBAL_SUMMARY_CSV, index=False)
+    per_model_stats(df, models_all).to_csv(SUMMARY_CSV, index=False)
+    pairwise_stats(df, models_all).to_csv(PAIRWISE_CSV, index=False)
 
-    plot_Jac_boxplot_models_success_overlap(df, jac_models)
-    plot_ac_reliability_plus_quality_panel(df, models_all, jac_models)
-    plot_pairwise_delta_Jac_success_only(df, jac_models)
-    plot_tradeoff_successrate_vs_Jac(df, jac_models)
+    plot_Jdc_boxplot_5(fig_dir, df, models_all)
+    plot_Jdc_boxplot_models_only(fig_dir, df, models_all)
+    plot_ac_fail_rate_bar(fig_dir, df, models_all)
+    plot_Jac_boxplot_models_success_only_common_success(fig_dir, df_jac, jac_models)
+    plot_pairwise_delta_Jac_success_only(fig_dir, df_jac, jac_models)
+    plot_tradeoff_successrate_vs_Jac(fig_dir, df_jac, jac_models)
 
-    print(f"\nSaved stats to:\n  {GLOBAL_SUMMARY_CSV}\n  {SUMMARY_CSV}\n  {PAIRWISE_CSV}")
-    print(f"Saved figures (PNG+PDF) to:\n  {FIG_DIR}")
+    print(f"\nSaved figures (PNG+PDF) to:\n  {fig_dir}")
 
 
 if __name__ == "__main__":

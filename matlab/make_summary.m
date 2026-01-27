@@ -40,7 +40,13 @@ n_line = size(mpc.branch,1);
 
 %% --- Load inputs ---
 limits = read_limits_yaml(limits_path);
-corrmap = jsondecode(fileread('config/corridor_map.json'));
+
+% Get the directory where limits.yml lives
+[config_dir, ~, ~] = fileparts(limits_path);
+corrmap_path = fullfile(config_dir, 'corridor_map.json');
+
+corrmap = jsondecode(fileread(corrmap_path));
+
 
 % xi normalization (robust to struct/mask/index list)
 xi_raw = jsondecode(fileread(xi_path));

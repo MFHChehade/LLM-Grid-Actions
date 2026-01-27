@@ -1,11 +1,11 @@
 budget: 3
 redispatch_cap: 5
-gamma: 100
+gamma: 10
 
 # Hybrid scoring (used only by DPO pair maker)
 alpha: 0.0          # scales DC objective (assuming DC ~2000)
 beta: 1.0           # voltage penalty weight (dominant)
-voltage_scale: 100_000  
+voltage_scale: 1 
 v_deadband: 0.00
 voltage_metric: L1   # or L2
 penalty_ac_fail: 1e6

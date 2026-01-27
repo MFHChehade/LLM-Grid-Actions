@@ -5,6 +5,9 @@
 #   - J_dc (DC-OPF cost for the chosen LLM plan from verify_plan)
 #   - J_dc_gt (ground-truth optimal DC-OPF with switching, run_ground_truth mode='mip_opt')
 #   - J_dc_base (baseline DC-OPF with no extra switching, run_ground_truth mode='baseline')
+#   - shed_MW (load shed for chosen LLM plan)
+#   - shed_MW_gt (load shed for mip_opt)
+#   - shed_MW_base (load shed for baseline)
 #
 # MATLAB functions used:
 #   make_summary(case_name, xi_json, limits_yml, out_summary_json)
@@ -14,9 +17,10 @@
 #
 # Outputs:
 #   io/eval_vselect_rows.csv/json
-#       per (xi, model): J_dc, J_ac, J_dc_gt, J_dc_base, best_plan_text
+#       per (xi, model): J_dc, J_ac, J_dc_gt, J_dc_base,
+#                       shed_MW, shed_MW_gt, shed_MW_base, best_plan_text
 #   io/eval_vselect_jdc_jac_per_xi.csv
-#       per xi: J_dc_*, J_ac_* per model + J_dc_gt + J_dc_base
+#       per xi: J_dc_*, J_ac_*, shed_MW_* per model + J_dc_gt + J_dc_base + shed_MW_gt + shed_MW_base
 #   io/eval_vselect_per_model.csv
 #       per-model stats on V/J_ac/J_dc
 #   io/eval_vselect_pairwise_v.csv
@@ -228,14 +232,16 @@ def main():
     rows: List[Dict[str, Any]] = []
 
     # caches so we don't recompute ground truth for each model
-    gt_opt_cache: Dict[str, float]   = {}
-    gt_base_cache: Dict[str, float]  = {}
+    gt_opt_J_cache: Dict[str, float]     = {}
+    gt_base_J_cache: Dict[str, float]    = {}
+    gt_opt_shed_cache: Dict[str, float]  = {}
+    gt_base_shed_cache: Dict[str, float] = {}
 
     for xi in xi_paths:
         xi_key = xi.as_posix()
 
         # --- per-xi ground truth: optimal (mip_opt) ---
-        if xi_key not in gt_opt_cache:
+        if xi_key not in gt_opt_J_cache:
             gt_opt_path = IO_DIR / f"gt_mip_opt_{xi.stem}.json"
             gt_opt_res  = call_run_ground_truth(xi, gt_opt_path, mode="mip_opt")
             if (
@@ -243,12 +249,18 @@ def main():
                 and isinstance(gt_opt_res.get("J"), (int, float))
                 and math.isfinite(gt_opt_res["J"])
             ):
-                gt_opt_cache[xi_key] = float(gt_opt_res["J"])
+                gt_opt_J_cache[xi_key] = float(gt_opt_res["J"])
+                shed_val = gt_opt_res.get("shed_MW")
+                if isinstance(shed_val, (int, float)) and math.isfinite(shed_val):
+                    gt_opt_shed_cache[xi_key] = float(shed_val)
+                else:
+                    gt_opt_shed_cache[xi_key] = float("nan")
             else:
-                gt_opt_cache[xi_key] = float("nan")
+                gt_opt_J_cache[xi_key]    = float("nan")
+                gt_opt_shed_cache[xi_key] = float("nan")
 
         # --- per-xi ground truth: baseline (do nothing beyond PSPS) ---
-        if xi_key not in gt_base_cache:
+        if xi_key not in gt_base_J_cache:
             gt_base_path = IO_DIR / f"gt_baseline_{xi.stem}.json"
             gt_base_res  = call_run_ground_truth(xi, gt_base_path, mode="baseline")
             if (
@@ -256,12 +268,20 @@ def main():
                 and isinstance(gt_base_res.get("J"), (int, float))
                 and math.isfinite(gt_base_res["J"])
             ):
-                gt_base_cache[xi_key] = float(gt_base_res["J"])
+                gt_base_J_cache[xi_key] = float(gt_base_res["J"])
+                shed_val = gt_base_res.get("shed_MW")
+                if isinstance(shed_val, (int, float)) and math.isfinite(shed_val):
+                    gt_base_shed_cache[xi_key] = float(shed_val)
+                else:
+                    gt_base_shed_cache[xi_key] = float("nan")
             else:
-                gt_base_cache[xi_key] = float("nan")
+                gt_base_J_cache[xi_key]    = float("nan")
+                gt_base_shed_cache[xi_key] = float("nan")
 
-        j_dc_gt   = gt_opt_cache[xi_key]
-        j_dc_base = gt_base_cache[xi_key]
+        j_dc_gt    = gt_opt_J_cache[xi_key]
+        j_dc_base  = gt_base_J_cache[xi_key]
+        shed_gt    = gt_opt_shed_cache[xi_key]
+        shed_base  = gt_base_shed_cache[xi_key]
 
         # --- PSPS summary for the LLM prompt ---
         summ_path = IO_DIR / f"summary_{xi.stem}.json"
@@ -312,7 +332,7 @@ def main():
             # AC side: v_pen == J_ac
             jac_value = v_eff(best_sc)
 
-            # DC-OPF verifier for the chosen plan: J_dc
+            # DC-OPF verifier for the chosen plan: J_dc and shed_MW
             p_dc = IO_DIR / f"eval_plan_dc_{label}_{xi.stem}_{random.randint(0, 9999)}.json"
             r_dc = IO_DIR / f"eval_res_dc_{label}_{xi.stem}_{random.randint(0, 9999)}.json"
             p_dc.write_text(json.dumps(best_pl), encoding="utf-8")
@@ -330,8 +350,14 @@ def main():
                 and math.isfinite(dc_sc["J"])
             ):
                 j_dc_value = float(dc_sc["J"])   # DC-OPF cost of LLM plan
+                shed_val = dc_sc.get("shed_MW")
+                if isinstance(shed_val, (int, float)) and math.isfinite(shed_val):
+                    shed_llm = float(shed_val)
+                else:
+                    shed_llm = float("nan")
             else:
                 j_dc_value = float("nan")
+                shed_llm   = float("nan")
 
             rows.append({
                 "xi": xi.as_posix(),
@@ -343,6 +369,9 @@ def main():
                 "J_dc_gt": j_dc_gt,             # ground truth (mip_opt)
                 "J_dc_base": j_dc_base,         # baseline (do nothing)
                 "best_plan_text": plan_to_text(best_pl),
+                "shed_MW": shed_llm,            # load shed for LLM plan
+                "shed_MW_gt": shed_gt,          # load shed for mip_opt
+                "shed_MW_base": shed_base,      # load shed for baseline
             })
 
     # Save rows (tall format)
@@ -362,6 +391,9 @@ def main():
                 "J_ac",
                 "J_dc_gt",
                 "J_dc_base",
+                "shed_MW",
+                "shed_MW_gt",
+                "shed_MW_base",
                 "best_plan_text",
             ],
         )
@@ -379,19 +411,22 @@ def main():
     df["J_ac"]            = pd.to_numeric(df["J_ac"], errors="coerce")
     df["J_dc_gt"]         = pd.to_numeric(df["J_dc_gt"], errors="coerce")
     df["J_dc_base"]       = pd.to_numeric(df["J_dc_base"], errors="coerce")
+    df["shed_MW"]         = pd.to_numeric(df["shed_MW"], errors="coerce")
+    df["shed_MW_gt"]      = pd.to_numeric(df["shed_MW_gt"], errors="coerce")
+    df["shed_MW_base"]    = pd.to_numeric(df["shed_MW_base"], errors="coerce")
 
-    # ---- Per-xi J_dc and J_ac in wide format ----
+    # ---- Per-xi J_dc, J_ac, shed_MW in wide format ----
     pivot_j = df.pivot_table(
         index="xi",
         columns="model",
-        values=["J_dc", "J_ac"],
+        values=["J_dc", "J_ac", "shed_MW"],
         aggfunc="first",
     )
     pivot_j.columns = [f"{metric}_{model}" for metric, model in pivot_j.columns]
     pivot_j = pivot_j.reset_index()
 
-    # Attach per-xi ground truth J_dc_gt and baseline J_dc_base
-    gt_df = df[["xi", "J_dc_gt", "J_dc_base"]].drop_duplicates("xi")
+    # Attach per-xi ground truth J_dc_gt / baseline and shedMW as well
+    gt_df = df[["xi", "J_dc_gt", "J_dc_base", "shed_MW_gt", "shed_MW_base"]].drop_duplicates("xi")
     pivot_j = pivot_j.merge(gt_df, on="xi", how="left")
 
     pivot_j.to_csv(IO_DIR / "eval_vselect_jdc_jac_per_xi.csv", index=False)
