@@ -93,14 +93,32 @@ def list_existing_psps(io_dir: Path) -> List[Path]:
     return sorted(files, key=lambda p: p.stat().st_mtime)
 
 def sample_psps_mask(n_line: int, corrmap: Dict[str, List[int]], k_open: int) -> List[int]:
-    """Create a PSPS mask of length n_line: 1=available, 0=forced open."""
+    """Create a PSPS mask where all forced-open lines come from a single corridor."""
     xi = [1] * n_line
-    union_ids = sorted({int(i) for ids in corrmap.values() for i in ids})
-    random.shuffle(union_ids)
-    for idx in union_ids[:k_open]:
+
+    # Only corridors that have at least k_open lines are eligible
+    eligible = [
+        (name, [int(i) for i in ids])
+        for name, ids in corrmap.items()
+        if len(ids) >= k_open
+    ]
+    if not eligible:
+        raise ValueError(f"No corridor has at least {k_open} lines for sampling.")
+
+    # Pick a random corridor
+    corr_name, line_ids = random.choice(eligible)
+
+    # Pick k_open distinct lines from this corridor
+    chosen = random.sample(line_ids, k_open)
+
+    for idx in chosen:
         if 1 <= idx <= n_line:
             xi[idx - 1] = 0
+        else:
+            raise ValueError(f"Line index {idx} out of range 1..{n_line}")
+
     return xi
+
 
 def save_json(path: Path, obj: Any):
     with open(path, "w") as f:

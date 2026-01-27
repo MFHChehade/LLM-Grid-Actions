@@ -28,8 +28,8 @@ def main():
         raise SystemExit(f"IO directory not found: {io_dir}")
 
     # Built-in prefixes + optional extras; case-insensitive match
-    # prefixes = {"res", "run_all", "report", "gt", "counts", "chosen", "case", "psps", "result", "resullt", "plan", "summary"}
-    prefixes = {"dpo"}
+    prefixes = {"inspect", "eval", "res", "run_all", "report", "gt", "counts", "chosen", "case", "psps", "result", "resullt", "plan", "summary","nb", "test", "qcap", "prefs", "xi", "plot", "sft", "tmp", "best"}
+    # prefixes = {"dpo"}
     prefixes |= {p.lower() for p in args.extra}
 
     deleted = 0
