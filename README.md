@@ -1,5 +1,5 @@
 
-## Workflow (recommended)
+## Workflow 
 
 > Note: the legacy "LLM pipeline" script is not required for the main experiments.
 > Use the scripts below in order.
